@@ -7,10 +7,10 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-# VEX Perfect Mirror 1.0.5
+# VEX Perfect Mirror 1.0.6
 # Independent sketch snapshots around Fusion's native component mirror.
 # All distances are in Fusion's internal cm units.
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 CMD_ID = 'VEXPerfectMirror_Command'
 REPORT_ID = 'VEXPerfectMirror_Report'
 HELP_ID = 'VEXPerfectMirror_Help'
@@ -954,6 +954,33 @@ def _assembly_relationship_snapshots(root, selected_occurrences):
     return joints, groups
 
 
+def _already_rigid(paths, joints, groups):
+    """Check active rigid connectivity, including indirect chains and larger groups."""
+    parents = {}
+    def find(path):
+        parents.setdefault(path, path)
+        if parents[path] != path:
+            parents[path] = find(parents[path])
+        return parents[path]
+    def join(members):
+        members = [path for path in members if path is not None]
+        for path in members[1:]:
+            parents[find(path)] = find(members[0])
+    for joint in joints:
+        if 'error' not in joint and not joint['suppressed'] and joint['type'] == adsk.fusion.JointTypes.RigidJointType:
+            join([joint['one'], joint['two']])
+    for group in groups:
+        if 'error' not in group and not group['suppressed']:
+            join(group['members'])
+    return len(paths) >= 2 and len({find(path) for path in paths}) == 1
+
+
+def _is_relationship_conflict(error):
+    message = str(error).casefold()
+    return ('over constrained' in message or 'overconstrained' in message or
+            'joint in system exists' in message)
+
+
 def _copy_rigid_relationships(root, source_joints, source_groups, stats):
     pairs = stats['occurrence_pairs']
     rigid_type = adsk.fusion.JointTypes.RigidJointType
@@ -979,7 +1006,7 @@ def _copy_rigid_relationships(root, source_joints, source_groups, stats):
         target_roots = [target for source, target in pairs if not any(
             target.fullPathName.startswith(other.fullPathName + '+')
             for _, other in pairs if other != target)]
-        current_joints, _ = _assembly_relationship_snapshots(root, target_roots)
+        current_joints, current_groups = _assembly_relationship_snapshots(root, target_roots)
         for candidate in current_joints:
             if 'error' in candidate:
                 _log(candidate['error'])
@@ -988,13 +1015,23 @@ def _copy_rigid_relationships(root, source_joints, source_groups, stats):
                 equivalent.append(candidate)
         if equivalent:
             if not all(j['type'] == rigid_type and j['suppressed'] == joint['suppressed'] for j in equivalent):
-                raise RuntimeError('Fusion generated an incompatible relationship: ' + joint['name'])
+                _omit_relationship(stats, joint['name'], 'An existing connection has different motion or suppression; preserved without adding another joint.')
+                continue
+            stats['rigid_joints'] += 1
+            continue
+        if not joint['suppressed'] and _already_rigid([one.fullPathName, two.fullPathName], current_joints, current_groups):
             stats['rigid_joints'] += 1
             continue
         data = root.asBuiltJoints.createInput(one, two, None)
         if not data or not data.setAsRigidJointMotion():
             raise RuntimeError('Could not define the mirrored rigid joint: ' + joint['name'])
-        created = root.asBuiltJoints.add(data)
+        try:
+            created = root.asBuiltJoints.add(data)
+        except RuntimeError as ex:
+            if not _is_relationship_conflict(ex):
+                raise RuntimeError('Could not recreate rigid joint {}: {}'.format(joint['name'], ex)) from ex
+            _omit_relationship(stats, joint['name'], 'Fusion rejected a redundant/conflicting joint; existing connections preserved. ' + str(ex))
+            continue
         if not created:
             raise RuntimeError('Could not create the mirrored rigid joint: ' + joint['name'])
         created.name = joint['name'] + ' [Mirror]'
@@ -1020,19 +1057,29 @@ def _copy_rigid_relationships(root, source_joints, source_groups, stats):
         target_roots = [target for _, target in pairs if not any(
             target.fullPathName.startswith(other.fullPathName + '+')
             for _, other in pairs if other != target)]
-        _, current_groups = _assembly_relationship_snapshots(root, target_roots)
+        current_joints, current_groups = _assembly_relationship_snapshots(root, target_roots)
         for candidate in current_groups:
             if 'error' not in candidate and sorted(candidate['members']) == expected:
                 existing.append(candidate)
         if existing:
             if any(g['suppressed'] != group['suppressed'] for g in existing):
-                raise RuntimeError('Fusion generated a rigid group with different suppression state.')
+                _omit_relationship(stats, group['name'], 'An existing rigid group has different suppression; preserved without adding another group.')
+                continue
+            stats['rigid_groups'] += 1
+            continue
+        if not group['suppressed'] and _already_rigid(expected, current_joints, current_groups):
             stats['rigid_groups'] += 1
             continue
         collection = adsk.core.ObjectCollection.create()
         for member in members:
             collection.add(member)
-        created = root.rigidGroups.add(collection, False)
+        try:
+            created = root.rigidGroups.add(collection, False)
+        except RuntimeError as ex:
+            if not _is_relationship_conflict(ex):
+                raise RuntimeError('Could not recreate rigid group {}: {}'.format(group['name'], ex)) from ex
+            _omit_relationship(stats, group['name'], 'Fusion rejected a redundant/conflicting rigid group; existing connections preserved. ' + str(ex))
+            continue
         if not created:
             raise RuntimeError('Could not recreate rigid group: ' + group['name'])
         created.name = group['name'] + ' [Mirror]'
