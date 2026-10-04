@@ -7,10 +7,10 @@ import os
 import tempfile
 from datetime import datetime, timezone
 
-# VEX Perfect Mirror 1.0.4
+# VEX Perfect Mirror 1.0.5
 # Independent sketch snapshots around Fusion's native component mirror.
 # All distances are in Fusion's internal cm units.
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 CMD_ID = 'VEXPerfectMirror_Command'
 REPORT_ID = 'VEXPerfectMirror_Report'
 HELP_ID = 'VEXPerfectMirror_Help'
@@ -819,7 +819,10 @@ def _normalize_selection(source_occs, root):
     if not source_occs:
         raise ValueError('Select at least one component.')
     unique = []
-    candidates = _iter_collection(getattr(root, 'allOccurrences', root.occurrences))
+    candidates = _iter_collection(root.occurrences)
+    # Most selections are top-level. Avoid asking Fusion to flatten linked/imported
+    # joint/occurrence proxies just to resolve a top-level component.
+    expanded = False
     for entity in source_occs:
         if entity is None:
             raise ValueError('Fusion returned an empty component selection. '
@@ -830,6 +833,9 @@ def _normalize_selection(source_occs, root):
             raise ValueError('The selection is stale: {} ({}). '
                              'Cancel and select it again in the Browser.'.format(name, kind))
         occurrence = adsk.fusion.Occurrence.cast(entity)
+        if not expanded and (occurrence is None or '+' in occurrence.fullPathName):
+            candidates = list(_walk_occurrences(candidates))
+            expanded = True
         if occurrence is None:
             component = adsk.fusion.Component.cast(entity)
             if component is None:
@@ -861,6 +867,12 @@ def _normalize_selection(source_occs, root):
         for parent in unique if parent != occurrence)]
 
 
+def _walk_occurrences(occurrences):
+    for occurrence in occurrences:
+        yield occurrence
+        yield from _walk_occurrences(_iter_collection(occurrence.childOccurrences))
+
+
 def _preflight_subtree(occurrence):
     component = occurrence.component
     if _iter_collection(component.meshBodies):
@@ -887,26 +899,59 @@ def _omit_relationship(stats, name, reason):
     stats['relationships_omitted'].append({'name': name, 'reason': reason})
 
 
-def _relationship_snapshot(entity, group=False):
+def _relationship_snapshot(entity, group=False, context_path=None):
     """Read relationship data before native feature creation can invalidate proxies."""
     if isinstance(entity, dict):
         return entity
+    def occurrence_path(occurrence):
+        if occurrence is None:
+            return None
+        path = occurrence.fullPathName
+        return context_path + '+' + path if context_path else path
     record = {'name': '(unreadable relationship)', 'suppressed': False}
     try:
-        record['name'] = entity.name
+        record['name'] = (context_path + ': ' if context_path else '') + entity.name
         record['suppressed'] = entity.isSuppressed
         if group:
-            record['members'] = [o.fullPathName for o in _iter_collection(entity.occurrences)]
+            record['members'] = [occurrence_path(o) for o in _iter_collection(entity.occurrences)]
         else:
             one, two = entity.occurrenceOne, entity.occurrenceTwo
-            record['one'] = one.fullPathName if one is not None else None
-            record['two'] = two.fullPathName if two is not None else None
+            record['one'] = occurrence_path(one)
+            record['two'] = occurrence_path(two)
             motion = entity.jointMotion
             record['type'] = motion.jointType if motion is not None else None
             record['visible'] = getattr(entity, 'isLightBulbOn', None)
     except Exception as ex:
         record['error'] = 'Fusion could not read relationship data: ' + str(ex)
     return record
+
+
+def _assembly_relationship_snapshots(root, selected_occurrences):
+    """Read native owning-component collections, avoiding flattened proxy creation."""
+    joints, groups = [], []
+    owners = [(root, None)] + [(o.component, o.fullPathName)
+                              for o in _walk_occurrences(selected_occurrences)]
+    for component, path in owners:
+        for local_name, legacy_name, group in (('joints', 'allJoints', False),
+                                               ('asBuiltJoints', 'allAsBuiltJoints', False),
+                                               ('rigidGroups', 'allRigidGroups', True)):
+            output = groups if group else joints
+            try:
+                try:
+                    collection = getattr(component, local_name)
+                except AttributeError:
+                    collection = getattr(component, legacy_name, [])
+                # Some offline mocks contain creation methods rather than a collection.
+                if not hasattr(collection, 'count') and not isinstance(collection, (list, tuple)):
+                    collection = getattr(component, legacy_name, [])
+                for entity in _iter_collection(collection):
+                    output.append(_relationship_snapshot(entity, group, path))
+            except Exception as ex:
+                # Never fabricate an exact omission count for an unreadable collection.
+                # A failure here must be actionable, with the owner and collection named.
+                raise RuntimeError('Could not read {} in {}: {}'.format(
+                    local_name, path or 'document root', ex)) from ex
+    return joints, groups
 
 
 def _copy_rigid_relationships(root, source_joints, source_groups, stats):
@@ -931,8 +976,11 @@ def _copy_rigid_relationships(root, source_joints, source_groups, stats):
         # Read current relationships defensively too: root collections can still
         # contain source proxies whose occurrence getters no longer work.
         equivalent = []
-        for current in list(root.allJoints) + list(root.allAsBuiltJoints):
-            candidate = _relationship_snapshot(current)
+        target_roots = [target for source, target in pairs if not any(
+            target.fullPathName.startswith(other.fullPathName + '+')
+            for _, other in pairs if other != target)]
+        current_joints, _ = _assembly_relationship_snapshots(root, target_roots)
+        for candidate in current_joints:
             if 'error' in candidate:
                 _log(candidate['error'])
                 continue
@@ -969,8 +1017,11 @@ def _copy_rigid_relationships(root, source_joints, source_groups, stats):
             continue
         expected = sorted(m.fullPathName for m in members)
         existing = []
-        for current in root.allRigidGroups:
-            candidate = _relationship_snapshot(current, group=True)
+        target_roots = [target for _, target in pairs if not any(
+            target.fullPathName.startswith(other.fullPathName + '+')
+            for _, other in pairs if other != target)]
+        _, current_groups = _assembly_relationship_snapshots(root, target_roots)
+        for candidate in current_groups:
             if 'error' not in candidate and sorted(candidate['members']) == expected:
                 existing.append(candidate)
         if existing:
@@ -1025,9 +1076,9 @@ def _mirror_selected_occurrences(source_occs, plane_entity, progress=None):
     for source in source_occs:
         _preflight_subtree(source)
     stats = _new_stats(reflection, progress)
-    original_definitions = [o.component for o in _iter_collection(root.allOccurrences)]
-    source_joints = [_relationship_snapshot(j) for j in list(root.allJoints) + list(root.allAsBuiltJoints)]
-    source_groups = [_relationship_snapshot(g, group=True) for g in root.allRigidGroups]
+    original_definitions = [o.component for o in _walk_occurrences(source_occs)]
+    original_definitions.extend(o.component for o in _iter_collection(root.occurrences))
+    source_joints, source_groups = _assembly_relationship_snapshots(root, source_occs)
     old_active = design.activeOccurrence
     try:
         if not design.activateRootComponent():
@@ -1153,6 +1204,9 @@ class _ExecuteHandler(adsk.core.CommandEventHandler):
         except Exception as ex:
             # Fusion's command transaction aborts on executeFailed, including
             # native mirrors, base features and relationship creation.
+            if not _last_report:
+                _save_report({'status': 'failed', 'stage': 'selection/preflight',
+                              'error': str(ex), 'traceback': traceback.format_exc()})
             args.executeFailed = True
             args.executeFailedMessage = str(ex) + '\nNo partial result will be kept.'
             if _last_report:
